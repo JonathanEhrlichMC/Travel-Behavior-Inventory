@@ -1,0 +1,173 @@
+---
+title: ""
+output:
+  html_document:
+    css: style.css
+    toc: TRUE
+    toc_float:
+      collapsed: TRUE
+      smooth_scroll: TRUE
+    code_folding: hide
+    theme: lumen
+    includes:
+      after_body: footer.html
+    
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = F, warning = F)
+```
+
+<br><br><br>
+
+![](Images/TBI Arial upper case title.png)
+
+```{r}
+library(data.table)
+library(tidyverse)
+library(leaflet)
+library(sf)
+library(lubridate)
+library(keyring)
+library(jsonlite)
+library(httr)
+library(RCurl)
+library(curl)
+library(RJSONIO)
+library(rgdal)
+
+path <- "C:\\Users\\sullivN\\Metropolitan Council\\Ehrlich, Jonathan - TBI_UnweightedQ1Deliverable\\Interim_Dataset\\"
+
+locations <- fread(paste0(path, "location_table.csv"))
+
+# How many unique trips are represented?
+num_trips <- locations %>%
+  dplyr::select(trip_id) %>%
+  unique() %>%
+  count()
+
+# On average, how many points do we get per trip?
+nrow(locations)/num_trips$n
+
+# Plot one trip to see how it looks
+trip_028 <- locations %>% filter(trip_id == 1837483301028)
+
+# Transform trip into sf object
+sf_028 <- st_as_sf(trip_028, coords = c("lon", "lat"),
+         crs = 4267,
+         agr = "constant")
+
+# Clean up date/time in order to use as "ping ID"
+start_end_028 <- sf_028 %>%
+  mutate(collected_time = str_replace(collected_time, ".000000", ""),
+         collected_time = as_datetime(collected_time),
+         end_time = max(collected_time),
+         start_time = min(collected_time)) %>%
+  mutate(Ping_category = ifelse(collected_time == end_time, "Trip_end",
+                                ifelse(collected_time == start_time, "Trip_start", "Trip_ping")))
+
+# Map trip route of chosen trip
+trip_time <- sf_028 %>%
+  mutate(popup = paste0("Time:", "<strong>", collected_time, "</strong>"))
+
+labs <- as.list(trip_time$popup)
+factpal <- colorFactor(c("red", "blue", "orange"), start_end_028$Ping_category)
+
+start_end_028 %>%
+leaflet() %>%
+  addCircleMarkers(
+      color = ~factpal(Ping_category),
+      fillColor = "none",
+      label = lapply(labs, htmltools::HTML),
+      labelOptions = labelOptions(style = list("font-family" = "Century Gothic",
+                                               "font-size" = "14px")),
+      radius = 2) %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  addLegend(pal = factpal,
+            values = ~start_end_028$Ping_category,
+            opacity = 0.5,
+            position = "bottomright",
+            title = NULL)
+```
+
+# Use Google's API to snap the points to the OSM
+
+Set key using `r keyring::key_set_with_value(service, username = NULL, password = NULL,
+  keyring = NULL)`, where *password* is the unique API key from Google. Note that the key is persistent beyond the close of the R session.
+  
+NOTE:  You must create a project with the Google Roads API enabled (use the Google API console to do so).  It does not matter what you name the project, or how many other APIs you enable.  You do not need to restrict the key. You **must** enable billing on the project in the Google console to use Google API.  If you do not enable the API within the project with which the key is associated *and* enable billing, you'll receive a 404 ("NOT FOUND") error.
+
+Found out that free trial for Google's API will only last one year; look at open source options.
+
+```{r}
+# Collate trip points in necessary format
+pings_id <- trip_028 %>%
+  mutate(collected_time = as_datetime(collected_time)) %>%
+  arrange(collected_time) %>%
+  unite(lat_lon, lat, lon, sep = ",") %>%
+  select(trip_id, lat_lon) %>%
+  group_by(trip_id) %>%
+  summarize(lat_lons = paste(lat_lon, collapse = "|"))
+
+# Retrieve API key
+API_key <- keyring::key_get("GoogleRoadsAPI", "nic.a.sull@gmail.com")
+
+# Make call
+req <- RCurl::getURL(url = paste0("https://roads.googleapis.com/v1/snapToRoads?path=", pings_id$lat_lons, "&interpolate=true&key=", API_key))
+
+# Get response
+request <- jsonlite::fromJSON(req) # Extract from JSON
+json_list <- map_if(request, is.data.frame, list) # Extract nested data.frame to list
+json_df <- as_tibble(json_list) # Create tibble from list
+response <- unnest(json_df) # Unnest list of data.frame & warning message
+response_lat_longs <- as.data.frame(response[[1]])
+
+# Map again
+response_lat_longs %>%
+leaflet() %>%
+  addCircleMarkers(
+      lng = ~longitude,
+      lat = ~latitude,
+      #label = lapply(labs, htmltools::HTML),
+      #labelOptions = labelOptions(style = list("font-family" = "Century Gothic",
+                                               #"font-size" = "14px")),
+      radius = 2) %>%
+  addProviderTiles(providers$CartoDB.Positron)
+```
+
+# Convert GPS pings to GPX file for use with graphhopper
+
+```{r}
+trip_028_conv <- start_end_028 %>%
+  mutate(trip_id = as.factor(trip_id))
+
+trip_028_spdf <- as(trip_028_conv, "Spatial")
+
+writeOGR(trip_028_spdf, dsn="C:\\Users\\sullivN\\OneDrive - Metropolitan Council\\MTS\\TBI\\gpxTEST.gpx",
+     dataset_options="GPX_USE_EXTENSIONS=yes", layer="waypoints", driver="GPX", overwrite_layer = T)
+
+```
+
+# Graphhopper API call
+
+```{r}
+# Retrieve API key
+graphhopper_key <- keyring::key_get("GraphhopperAPI")
+
+# Make call
+map_match <- httr::POST(paste0("https://graphhopper.com/api/1/match?vehicle=car&key=", graphhopper_key),
+                         config = add_headers('Content-Type' = 'application/gpx+xml'),
+                         body = upload_file("C:\\Users\\sullivN\\OneDrive - Metropolitan Council\\MTS\\TBI\\gpxTEST.gpx", type = "gpx"))
+
+
+```
+
+```{r}
+bing_key <- keyring::key_get("BingMapsAPI", username = "nicasull@gmail.com")
+
+# Make call
+map_match <- httr::POST(paste0("https://dev.virtualearth.net/REST/v1/Routes/SnapToRoadAsync?key=", bing_key),
+                         config = add_headers('Content-Type' = 'application/json'),
+                         body = upload_file("C:\\Users\\sullivN\\OneDrive - Metropolitan Council\\MTS\\TBI\\gpxTEST.gpx", type = "gpx"))
+```
+
