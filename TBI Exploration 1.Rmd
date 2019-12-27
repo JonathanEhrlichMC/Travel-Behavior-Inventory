@@ -1,0 +1,632 @@
+---
+title: ""
+output:
+  html_document:
+    css: style.css
+    toc: TRUE
+    toc_float:
+      collapsed: TRUE
+      smooth_scroll: TRUE
+    code_folding: hide
+    theme: lumen
+    includes:
+      after_body: footer.html
+    
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = F, warning = F)
+```
+
+<br><br><br>
+
+![](Images/TBI Arial upper case title.png)
+
+```{r results, results = 'hide'}
+library(tidyverse)
+library(data.table)
+library(sf)
+library(leaflet)
+library(openxlsx)
+library(plotly)
+library(extrafont)
+library(devtools)
+library(epuRate)
+library(rgdal)
+library(tigris)
+
+extrafont::loadfonts()
+
+base <- "C:\\Users\\sullivN\\OneDrive - Metropolitan Council\\MTS\\TBI\\"
+tbi_base <- "C:\\Users\\sullivN\\OneDrive - Metropolitan Council\\MTS\\TBI\\Interim_Dataset\\"
+
+#locations <- st_read(paste0(tbi_base, "locations_nad83.shp"))
+#counties <- st_read(paste0(base, "U.S. Counties/tl_2017_us_county.shp"))
+trips <- fread(paste0(tbi_base, "trip_table.csv"))
+person <- fread(paste0(tbi_base, "person_table.csv"))
+hh <- fread(paste0(tbi_base, "hh_table.csv"))
+person_codes <- read.xlsx(paste0(base, "Wave1_Interim_Codebook.xlsx"), sheet = "person")
+trip_codes <- read.xlsx(paste0(base, "Wave1_Interim_Codebook.xlsx"), sheet = "trip")
+bgs <- readOGR(paste0(base, "Addtl_Data/7-County BGs/Census2010TigerBlockGroup.shp"))
+bg_centroids <- readOGR(paste0(base, "Addtl_Data/7-County BGs/Census2010TigerBlockGroup_Centroids.shp"))
+#tracts <- readOGR(paste0(base, "Addtl_Data/"))
+ctu_bgs <- read_csv(paste0(base, "Addtl_Data/ctus_bgs.csv")) %>% mutate(GEOID10 = as.character(BG))
+
+age_codes <- person_codes %>%
+  filter(variable == "age")
+
+# person %>%
+#   mutate(age = as.factor(age)) %>%
+#   group_by(age) %>%
+#   count() %>%
+#   ggplot(aes(age, n)) +
+#   geom_bar(stat = "identity")
+
+trips_person <- left_join(trips, person, by = "person_id") %>% mutate(age = as.character(age))
+trips_person_age <- left_join(trips_person, age_codes, by = c("age" = "value"))
+```
+
+
+# Smart-Phone Ownership
+## Trips by smart-phone owners and non-smartphone owners
+####**Within the study, what percentage of trips were taken by smartphone owners and what percentage were taken by non-smartphone owners?**
+***
+Because of the rise of smartphones, apps, and location-based services (LBS) data, the use of LBS data for decision-making in urban and local planning is spreading rapidly. It's important, therefore, to investigate differences in travel behavior of smartphone owners from non-smartphone owners, who are excluded from LBS datasets.
+<br>
+
+```{r}
+smartphone_prop <- trips_person_age %>%
+  mutate(smartphone_type = ifelse(smartphone_type == 0, "No_smartphone", "Smartphone")) %>%
+  group_by(smartphone_type) %>%
+  count() %>%
+  ungroup() %>%
+  spread(smartphone_type, value = n) %>%
+  mutate(Total_trips = No_smartphone + Smartphone) %>%
+  gather(No_smartphone, Smartphone, key = "User_type", value = "Trips_by_user") %>%
+  mutate(Percent_trips = Trips_by_user/Total_trips,
+         MOE_99_pc = 2.58*sqrt((Percent_trips*(1-Percent_trips))/Total_trips)*100,
+         Percent_trips = Percent_trips*100)
+```
+
+About `r smartphone_prop %>% filter(User_type == "Smartphone") %>% dplyr::select(Percent_trips) %>% round()`% of trips were taken by smartphone owners, meaning only about `r smartphone_prop %>% filter(User_type == "Smartphone") %>% dplyr::select(Percent_trips) %>% round()`% (+/- `r smartphone_prop %>% filter(User_type == "Smartphone") %>% dplyr::select(MOE_99_pc) %>% round(1)`%) of trips in our region are excluded from LBS sampling procedures.
+
+```{r,  fig.align='center'}
+         
+smartphone_prop_plot <- smartphone_prop %>%
+  mutate(User_type = ifelse(User_type == "No_smartphone", "Doesn't own smartphone", "Owns smartphone")) %>%
+ggplot(aes(User_type, Percent_trips)) +
+  geom_bar(stat = "identity", width = 0.1, fill = "#9ebcda") +
+  geom_errorbar(aes(ymin = Percent_trips-MOE_99_pc, ymax = Percent_trips+MOE_99_pc),
+                width= 0.1) +
+  geom_text(aes(x = User_type, y = Percent_trips+5),
+            label = paste0(round(smartphone_prop$Percent_trips, 1), "% +/- ", round(smartphone_prop$MOE_99_pc, 2), "%"),
+            family = "Segoe UI Light") +
+  labs(title = "Percentage of Trips taken by User Type",
+       x = "",
+       y = "") +
+  theme(text = element_text(family = "Segoe UI Light"),
+        plot.title = element_text(hjust = 0.5, size = 20),
+        axis.ticks = element_blank(),
+        panel.background = element_rect(fill = "white"),
+        axis.text.y = element_blank())
+
+ggplotly(smartphone_prop_plot)
+```
+
+## Non-smartphone owner demographics
+####**Is there any bias in age of non-smartphone owners in the study?**
+***
+We know from numerous studies that Baby Boomers are less likely to be smartphone owners, and our region is no different in this respect.  From the graph below, we can see that non-smartphone users in our study are overwhelmingly 55+, with no apparent differences across genders.
+
+```{r,  fig.align='center'}
+smartphone_age <- trips_person_age %>%
+  filter(smartphone_type == 0) %>%
+  dplyr::select(value_label, gender, person_id) %>%
+  unique() %>%
+  mutate(User_type = ifelse(value_label == "55-64" | value_label == "65-74" | value_label == "75 or older", "55+", "18-54"),
+         gender = ifelse(gender == 1, "Female",
+                         ifelse(gender == 2, "Male", "Transgender, other"))) %>%
+  unite(User_type, User_type, gender, sep = ",\n") %>%
+  group_by(User_type) %>%
+  count() %>%
+  ungroup() %>%
+  mutate(Total_trips = sum(n)) %>%
+  rename(Trips_by_user = n) %>%
+  mutate(Percent_trips = Trips_by_user/Total_trips,
+         MOE_99_pc = 2.58*sqrt((Percent_trips*(1-Percent_trips))/Total_trips)*100,
+         Percent_trips = Percent_trips*100)
+
+no_smartphone_plot <- smartphone_age %>%
+ggplot(aes(User_type, Percent_trips, fill = cut(Percent_trips, 3))) +
+  geom_bar(stat = "identity", width = 0.2) +
+  geom_errorbar(aes(ymin = ifelse(Percent_trips-MOE_99_pc < 0, 0, Percent_trips-MOE_99_pc), ymax = Percent_trips+MOE_99_pc),
+                width= 0.05) +
+  geom_text(aes(x = User_type, y = Percent_trips+7),
+            label = paste0(round(smartphone_age$Percent_trips, 1), "% +/- ", round(smartphone_age$MOE_99_pc, 2), "%"),
+            family = "Segoe UI Light",
+            size = 3) +
+  scale_fill_brewer(palette = "PuBuGn") +
+  labs(title = "Non-smartphone owners broken down by age and gender",
+       x = "",
+       y = "") +
+  theme(text = element_text(family = "Segoe UI Light"),
+        plot.title = element_text(hjust = 0.5, size = 15),
+        axis.ticks = element_blank(),
+        panel.background = element_rect(fill = "white"),
+        axis.text.y = element_blank(),
+        legend.position = "none")
+
+ggplotly(no_smartphone_plot)
+```
+
+## Smartphone owner demographics
+####**Compare these values to the values for smartphone users.**
+***
+
+```{r,  fig.align='center'}
+lbs_age_gender <- trips_person_age %>%
+  mutate(Smartphone = ifelse(smartphone_type == 0, "No smartphone", "Smartphone")) %>%
+  dplyr::select(value_label, gender, person_id, Smartphone) %>%
+  unique() %>%
+  mutate(User_type = ifelse(value_label == "55-64" | value_label == "65-74" | value_label == "75 or older", "55+", "5-54"),
+         gender = ifelse(gender == 1, "Female",
+                         ifelse(gender == 2, "Male", "Other"))) %>%
+  mutate(User_type = paste0(Smartphone, ",\n", User_type, ", ", gender)) %>%
+  group_by(User_type, Smartphone) %>%
+  count() %>%
+  ungroup() %>%
+  mutate(Total_trips = sum(n)) %>%
+  rename(Trips_by_user = n) %>%
+  mutate(Percent_trips = Trips_by_user/Total_trips,
+         MOE_99_pc = 2.576*sqrt((Percent_trips*(1-Percent_trips))/Total_trips)*100,
+         Percent_trips = Percent_trips*100)
+
+lbs_age_gender_plot <- lbs_age_gender %>%
+ggplot(aes(User_type, Percent_trips, fill = Smartphone)) +
+  geom_bar(stat = "identity", width = 0.4) +
+  geom_errorbar(aes(ymin = ifelse(Percent_trips-MOE_99_pc < 0, 0, Percent_trips-MOE_99_pc), ymax = Percent_trips+MOE_99_pc),
+                width= 0.05) +
+  coord_flip() +
+  scale_fill_brewer(palette = "PuBuGn") +
+  labs(title = "Smartphone and Non-smartphone owners broken down by age and gender",
+       x = "",
+       y = "") +
+  theme(text = element_text(family = "Segoe UI Light"),
+        plot.title = element_text(hjust = 0.5, size = 15),
+        axis.ticks = element_blank(),
+        axis.text.x = element_blank(),
+        panel.background = element_rect(fill = "white"))
+
+ggplotly(lbs_age_gender_plot)
+```
+
+## Participant Composition
+####**Take a look at overall percentages of different groups in the study.**
+***
+
+
+```{r,  fig.align='center'}
+age_gender <- trips_person_age %>%
+  dplyr::select(value_label, gender, person_id) %>%
+  unique() %>%
+  mutate(Gender = ifelse(gender == 1, "Female",
+                         ifelse(gender == 2, "Male", "Other"))) %>%
+  group_by(value_label, Gender) %>%
+  count() %>%
+  ungroup() %>%
+  mutate(Total_users = sum(n)) %>%
+  rename(Users = n) %>%
+  mutate(Age = factor(value_label, levels = c("Under 5",
+                                              "5-15",
+                                              "16-17",
+                                              "18-24",
+                                              "25-34",
+                                              "35-44",
+                                              "45-54",
+                                              "55-64",
+                                              "65-74",
+                                              "75 or older")))
+
+age_gender_plot <- age_gender %>%
+ggplot(aes(Age, Users, fill = Gender)) +
+  geom_bar(stat = "identity", width = 0.2) +
+  scale_fill_brewer(palette = "PuBuGn") +
+  labs(title = "Participants broken down by age and gender",
+       x = "",
+       y = "") +
+  theme(text = element_text(family = "Segoe UI Light"),
+        plot.title = element_text(hjust = 0.5, size = 15),
+        axis.ticks = element_blank(),
+        panel.background = element_rect(fill = "white"),
+        legend.position = "bottom")
+
+ggplotly(age_gender_plot)
+```
+
+## Volume of Travel for non-smartphone users
+####**Are there any differences in volume of travel for non-smartphone users?**
+***
+
+Smartphone users have a slightly higher median trips per day than non-smartphone users - probably owing to the demographic slant of non-smartphone users (mainly 55+).
+
+
+```{r,  fig.align='center'}
+days_per_person <- trips_person_age %>%
+  dplyr::select(person_id, travel_date) %>%
+  unique() %>%
+  group_by(person_id) %>%
+  count() %>%
+  rename(Days = n)
+
+trips_per_person <- trips_person_age %>%
+  mutate(smartphone = ifelse(smartphone_type == 0, "No smartphone", "Smartphone")) %>%
+  group_by(person_id, smartphone) %>%
+  count() %>%
+  rename(Trips = n)
+
+days_trips_person <- full_join(days_per_person, trips_per_person, by = c("person_id"))
+
+av_trips_day <- days_trips_person %>%
+  mutate(Trips_per_day = Trips/Days) %>%
+  group_by(smartphone) %>%
+  mutate(Av_trips = mean(Trips_per_day),
+         Median_trips = median(Trips_per_day)) %>%
+  dplyr::select(-person_id, -Trips, -Days, -Trips_per_day) %>%
+  unique()
+
+
+av_trips_plot <- av_trips_day %>%
+ggplot(aes(smartphone, Median_trips)) +
+  geom_bar(stat = "identity", width = 0.2, fill = "#9ebcda") +
+  geom_text(aes(x = smartphone, y = Median_trips+0.5),
+            label = round(av_trips_day$Median_trips, 1),
+            family = "Segoe UI Light") +
+  labs(title = "Median trips per day by phone owner type",
+       x = "",
+       y = "") +
+  theme(text = element_text(family = "Segoe UI Light"),
+        plot.title = element_text(hjust = 0.5, size = 15),
+        axis.ticks = element_blank(),
+        panel.background = element_rect(fill = "white"),
+        axis.text.y = element_blank())
+
+ggplotly(av_trips_plot)
+```
+
+
+```{r}
+# Create line configuration of origin/destination lat/longs
+# library(inlabru)
+# library(rgdal)
+# 
+# # Conversion to SpatialLinesDataFrame without CRS
+# spl <- sline(trips, start.cols = c("o_lon", "o_lat"),
+#              end.cols = c("d_lon", "d_lat"))
+# 
+# # Add CRS projection
+# proj4string(spl) <- CRS("+init=epsg:4267")
+# 
+# spl$trip_id <- as.character(spl$trip_id)
+# 
+# writeOGR(spl, "C:/Users/sullivN", "Trips O-D Lines", "ESRI Shapefile")
+
+```
+
+# SOV Hyper-travelers
+## 20+ mile trips in an SOV, as a % of a block group's trips
+####**Of a block group's total trips in the study period, what percentage were trips in a single-occupancy vehicle that exceeded 20 miles?**
+***
+
+Block groups' geographic size vary greatly depending on the spatial distribution of the population.  Below block groups are visualized as their *centroid* (center point) to avoid any visual skewing of the data.   Interestingly, higher proportions of 20+ mile trips are not limited to the suburbs - some Minneapolis block groups also exhibit high proportions of trips exceeding 20 miles and made in a single-occupancy vehicle.  Note that the map below shows block group *of residence*, not block group of trip start, and does not attempt to adjust for differing sample sizes/populations in different block groups.
+
+```{r,  fig.align='center'}
+library(htmltools)
+bg_map <- spTransform(bg_centroids, CRS("+init=epsg:4267"))
+
+bg_sf <- st_as_sf(bg_map) %>%
+  mutate(GEOID10 = as.character(GEOID10))
+
+# SOV hyper-trips (20+ miles)
+trips_GT_20 <- trips %>%
+  filter(distance > 20 & num_travelers == 1) %>%
+  mutate(Vehicle_mode = ifelse(mode_1 > 5 & mode_1 < 18, 1,
+                               ifelse(mode_1 == 22 |
+                                        mode_1 == 34 |
+                                        mode_1 == 36 |
+                                        mode_1 == 37 |
+                                        mode_1 == 49, 1, 0))) %>%
+  filter(Vehicle_mode == 1) %>%
+  dplyr::select(travel_date, trip_id, hh_id, person_id)
+
+# Trips in bg that were SOV 20+ miles
+trips_GT_20_hh <- left_join(trips_GT_20, hh, by = "hh_id")
+
+trips_GT_20_bg_n <- trips_GT_20_hh %>%
+  group_by(reported_home_bg) %>%
+  count() %>%
+  rename(Trips_GT_20 = n)
+
+# Total trips in bg
+trips_hh <- left_join(trips, hh, by = "hh_id")
+
+tot_trips_bg <- trips_hh %>%
+  group_by(reported_home_bg) %>%
+  count() %>%
+  rename(Total_trips = n)
+
+trips_GT_20_prop <- left_join(trips_GT_20_bg_n, tot_trips_bg, by = "reported_home_bg") %>%
+  mutate(Percent_trips_GT_20 = Trips_GT_20/Total_trips*100) %>%
+  mutate(GEOID10 = as.character(reported_home_bg))
+
+trips_per_day_ctu <- left_join(trips_GT_20_prop, ctu_bgs, by = "GEOID10")
+trips_per_day_bg <- inner_join(bg_sf, trips_per_day_ctu, by = "GEOID10")
+
+long_trips_map <- trips_per_day_bg %>%
+  filter(!is.na(Percent_trips_GT_20)) %>%
+  mutate(popup = paste0("% of all bg residents' trips <br>that were 20+ miles and SOV: ", "<strong>", prettyNum(Percent_trips_GT_20), "</strong>", "<br><strong>", Municipalities, "</strong"))
+
+labs <- as.list(long_trips_map$popup)
+
+long_trips_map %>%
+leaflet() %>%
+  addCircleMarkers(#highlightOptions = highlightOptions(color = "white", weight = 2,
+      #bringToFront = TRUE),
+      color = "#006699",
+        # ~colorQuantile("PuBu", Percent_trips_GT_20, n = 8)(Percent_trips_GT_20),
+      fillColor = "none",
+      label = lapply(labs, htmltools::HTML),
+      labelOptions = labelOptions(style = list("font-family" = "Segoe UI Light",
+                                               "font-size" = "14px")),
+      radius = ~Percent_trips_GT_20/5) %>%
+  addProviderTiles(providers$CartoDB.Positron) #%>%
+  # addLegend("bottomright",
+  #           pal = colorNumeric(palette = "PuBu",
+  #                              domain = long_trips_map$Percent_trips_GT_20),
+  #           values = ~Percent_trips_GT_20,
+  #           opacity = 1,
+  #           title = "% of total trips <br> that were SOV & 20+ mi.",
+  #           labFormat = labelFormat(suffix = "%"))
+
+```
+##20+ mile SOV trips per participant per day by block group
+####**What does hyper-travel in the region look like when averaged across all participants that were residents of a block group, and total days of participation per block group?**
+***
+
+Block groups in Richfield and Eden Prairie appear to have either multiple residents and/or multiple days with hyper-travel.
+
+```{r,  fig.align='center'}
+library(htmltools)
+bg_map <- spTransform(bg_centroids, CRS("+init=epsg:4267"))
+
+bg_sf <- st_as_sf(bg_map) %>%
+  mutate(GEOID10 = as.character(GEOID10))
+
+trips_hh <- left_join(trips, hh, by = c("hh_id"))
+
+trips_per_bg <- trips_hh %>%
+  filter(distance > 20) %>%
+  group_by(reported_home_bg) %>%
+  count() %>%
+  rename(Trips_GT_20_mi = n)
+
+days_per_bg <- trips_hh %>%
+  dplyr::select(reported_home_bg, travel_date) %>%
+  unique() %>%
+  group_by(reported_home_bg) %>%
+  count() %>%
+  rename(Days = n)
+
+partipants_per_bg <- trips_hh %>%
+  dplyr::select(reported_home_bg, person_id) %>%
+  unique() %>%
+  group_by(reported_home_bg) %>%
+  count() %>%
+  rename(Persons = n)
+
+trips_day_bg <- full_join(trips_per_bg, days_per_bg, by = "reported_home_bg")
+trips_day_person_bg <- left_join(trips_day_bg, partipants_per_bg, by = "reported_home_bg")
+
+trips_per_day <- trips_day_person_bg %>%
+  mutate(Trips_pdpp_GT_20 = Trips_GT_20_mi/Persons/Days) %>%
+  select(Trips_pdpp_GT_20) %>%
+  mutate(GEOID10 = as.character(reported_home_bg))
+
+trips_per_day_ctu <- left_join(trips_per_day, ctu_bgs, by = "GEOID10")
+trips_per_day_bg <- inner_join(bg_sf, trips_per_day_ctu, by = "GEOID10")
+
+long_trips_map <- trips_per_day_bg %>%
+  filter(!is.na(Trips_pdpp_GT_20)) %>%
+  mutate(popup = paste0("# of 20+ mi. trips <br>(per participant per study day): ", "<strong>", prettyNum(Trips_pdpp_GT_20), "</strong>", "<br><strong>", Municipalities, "</strong"))
+
+labs <- as.list(long_trips_map$popup)
+
+long_trips_map %>%
+leaflet() %>%
+  addCircleMarkers(
+      color = "#006699",
+        # colorQuantile("PuBu", long_trips_map$Trips_pdpp_GT_20, n = 8)(long_trips_map$Trips_pdpp_GT_20),
+      fillColor = "none",
+      label = lapply(labs, htmltools::HTML),
+      labelOptions = labelOptions(style = list("font-family" = "Segoe UI Light",
+                                               "font-size" = "14px")),
+      radius = ~Trips_pdpp_GT_20*3) %>%
+  addProviderTiles(providers$CartoDB.Positron) #%>%
+    # addLegend("bottomright",
+    #         pal = colorQuantile(palette = "PuBu",
+    #                            domain = long_trips_map$Trips_pdpp_GT_20,
+    #                            n = 8),
+    #         values = ~Trips_pdpp_GT_20,
+    #         opacity = 0.7,
+    #         title = "# of 20+ mi. trips <br> per participant <br> per study day",
+    #         labFormat = labelFormat(suffix = " trips"))
+
+```
+
+# Local v. Express
+
+```{r}
+trips_person <- left_join(trips, person, by = "person_id")
+
+local_express_afam <- trips_person %>%
+  filter(mode_1 == 55 | mode_1 == 23) %>%
+  mutate(Mode = ifelse(mode_1 == 55, "Express", "Local")) %>%
+  group_by(Mode, ethnicity_afam) %>%
+  count() %>%
+  rename(Afam_sum = n) %>%
+  group_by(Mode) %>%
+  mutate(Mode_sum = sum(Afam_sum),
+         Afam_prop = Afam_sum/Mode_sum) %>%
+  filter(ethnicity_afam == 1) %>%
+  select(-ethnicity_afam) %>%
+  mutate(MOE_99 = 2.576*sqrt((Afam_prop*(1-Afam_prop))/Mode_sum),
+         MOE_99_pc = MOE_99*100,
+         Afam_pc = Afam_prop*100)
+
+local_express_plot <- local_express_afam %>%
+ggplot(aes(Mode, Afam_pc)) +
+  geom_bar(stat = "identity", width = 0.2, fill = "#CCCCFF", alpha = 0.75) +
+  geom_errorbar(aes(ymin = ifelse(Afam_pc-MOE_99_pc < 0, 0, Afam_pc-MOE_99_pc), ymax = Afam_pc+MOE_99_pc),
+                width = 0.05,
+                color = "grey65") +
+  scale_fill_brewer(palette = "PuBuGn") +
+  labs(title = "African American Share of Local v. Express Routes Ridership",
+       x = "",
+       y = "") +
+  theme(text = element_text(family = "Segoe UI Light"),
+        plot.title = element_text(hjust = 0.5, size = 15),
+        axis.ticks = element_blank(),
+        panel.background = element_rect(fill = "white"))
+
+ggplotly(local_express_plot)
+
+
+# plot_ly(local_express_afam,
+#     type = 'bar',
+#     x = ~Mode,
+#     y = ~Afam_pc,
+#     color = "#9999FF",
+#     width = 0.2,
+#     hoverinfo = "text",
+#     text = ~paste("Mode: ", Mode, "<br>",
+#                   "% African American ridership: ", round(Afam_pc, 2), "<br>",
+#                   "99% MOE: ", round(MOE_99_pc, 2)),
+#     textfont = list(color = '#264E86',
+#                               family = 'sans serif',
+#                               size = 25)
+#     ) %>%
+#   layout(title = "African American Ridership on Local v. Express Routes",
+#          xaxis = list(title = ""),
+#          yaxis = list(title = "% African American Ridership")))
+  
+```
+
+```{r}
+le_afam_white <- trips_person %>%
+  filter(mode_1 == 55 | mode_1 == 23) %>%
+  filter(ethnicity_afam == 1 | ethnicity_white == 1) %>%
+  gather(ethnicity_afam, ethnicity_white, key = "Race_Ethnicity", value = "Race_ethn_value") %>%
+  filter(Race_ethn_value != 0) %>%
+  mutate(Mode = ifelse(mode_1 == 55, "Express", "Local")) %>%
+  dplyr::select(Mode, Race_Ethnicity, duration, trip_id) %>%
+  mutate(Race_Ethnicity = ifelse(Race_Ethnicity == "ethnicity_afam", "African American", "White")) %>%
+  mutate(Race_Ethnicity = factor(Race_Ethnicity, levels = c("White", "African American")))
+
+le_afam_white_plot <- le_afam_white %>%
+    ggplot(aes(duration, fill = Race_Ethnicity, color = Race_Ethnicity)) +
+  geom_density(alpha = 0.5) +
+  scale_x_continuous(limits = c(0, 90)) +
+  scale_fill_brewer(palette = "PuBuGn") +
+  scale_color_brewer(palette = "PuBuGn") +
+  facet_wrap(~Mode) +
+  labs(fill = "",
+       color = "",
+       title = "Ride Durations on Local/Express Routes") +
+  theme(text = element_text(family = "Segoe UI Light"),
+        plot.title = element_text(hjust = 0.5, size = 25),
+        axis.ticks = element_blank(),
+        panel.background = element_rect(fill = "white"),
+        legend.position = "bottom",
+        strip.background = element_rect(fill = "white"))
+  
+ggplotly(le_afam_white_plot) %>%
+  layout(legend = list(orientation = "h", y = -0.15, x = 0.35))
+
+```
+
+```{r}
+
+le_afam_white_dist <- le_afam_white %>%
+    ggplot(aes(duration, fill = Race_Ethnicity, color = Race_Ethnicity)) +
+  geom_histogram(alpha = 0.5) +
+  scale_x_continuous(limits = c(0, 90)) +
+  scale_fill_brewer(palette = "PuBuGn") +
+  scale_color_brewer(palette = "PuBuGn") +
+  facet_wrap(~Mode) +
+  labs(fill = "",
+       color = "",
+       title = "Ride Durations on Local/Express Routes") +
+  theme(text = element_text(family = "Segoe UI Light"),
+        plot.title = element_text(hjust = 0.5, size = 25),
+        axis.ticks = element_blank(),
+        panel.background = element_rect(fill = "white"),
+        legend.position = "bottom",
+        strip.background = element_rect(fill = "white"))
+  
+ggplotly(le_afam_white_dist) %>%
+  layout(legend = list(orientation = "h", y = -0.15, x = 0.35))
+
+
+```
+
+<script type = "text/javascript">
+
+# Plotly.newPlot('graph', [{
+#   type: 'scatter3d',
+#   x: [1, 2, 3].reverse(),
+#   y: [1, 2, 3],
+#   z: [1, 2, 1],
+#   name: 'dataset 1',
+#   text: ['A', 'B', 'C'],
+#   hoverinfo: 'text+name'
+# }], {
+#   hoverlabel: {
+#     bgcolor: 'black',
+#     font: {color: 'white'}
+#   }
+# })
+</script>
+
+<script> var data = [
+  {
+    x: ['giraffes', 'orangutans', 'monkeys'],
+    y: [20, 14, 23],
+    type: 'bar'
+  }
+];
+
+Plotly.newPlot('myDiv', data);
+</script>
+
+
+```{r}
+# Create U.S. tracts shapefile
+library(parallel)
+# library(doParallel)
+# library(foreach)
+# # Setting up parallel conection
+# num_cores <- detectCores() # Check how many cores are present - trying to use more than this many won't provide any benefit
+# registerDoParallel(num_cores)
+# us_tracts <- vector("list", 50)
+# 
+# foreach (i = c(1:2, 4:6, 8:10, 12:13, 15:42, 44:51, 53:56)) %dopar% {
+#   library(tigris)
+#   try(us_tracts[[i]] <- tigris::tracts(i))
+# }
+# 
+# us_tracts_shp <- do.call("rbind", us_tracts)
+# 
+# leaflet(us_tracts_shp) %>%
+#   addPolygons() %>%
+#   addTiles()
+```
+

@@ -1,0 +1,19 @@
+---
+title: "Creating CTU Attributions"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+
+ctu <- read_csv(paste0(base, "Addtl_Data\\BlocksWithCTUs.csv"))
+
+ctu_collapsed <- ctu %>%
+  mutate(BG = as.numeric(substring(BLK10, 1, 12))) %>%
+  dplyr::select(CTU_NAME, BG) %>%
+  unique() %>%
+  group_by(BG) %>%
+  summarize(Municipalities = paste(CTU_NAME, collapse = ", "))
+
+write_csv(ctu_collapsed, paste0(base, "Addtl_Data/ctus_bgs.csv"))
+```
